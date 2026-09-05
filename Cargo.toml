@@ -1,0 +1,11 @@
+[package]
+name = "memory-allocator"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "memory-allocator"
+path = "main.rs"
+
+[dependencies]
+# Your external crates/libraries go here
