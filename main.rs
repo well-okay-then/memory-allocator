@@ -1,7 +1,13 @@
 use std::io::{self, BufRead};
 
-const HEAD_SIZE: i32 = 8;
 const MIN_SPLIT: i32 = 16;
+
+#[derive(Clone, Copy)]
+enum Strategy {
+    First,
+    Best,
+    Worst,
+}
 
 struct Block {
     addr: i32,
@@ -14,6 +20,7 @@ struct Block {
 struct Allocator {
     blocks: Vec<Block>,
     head: Option<usize>,
+    strategy: Strategy,
 }
 
 impl Allocator {
@@ -21,17 +28,18 @@ impl Allocator {
         Allocator {
             blocks: Vec::new(),
             head: None,
+            strategy: Strategy::First,
         }
     }
 
-    fn init(&mut self, size: i32) {
+    fn init(&mut self, size: i32, strategy: Strategy) {
         self.blocks.clear();
         self.head = None;
-        let usable = size - HEAD_SIZE;
-        if usable > 0 {
+        self.strategy = strategy;
+        if size > 0 {
             self.blocks.push(Block {
-                addr: HEAD_SIZE,
-                size: usable,
+                addr: 0,
+                size,
                 used: false,
                 prev: None,
                 next: None,
@@ -40,42 +48,58 @@ impl Allocator {
         }
     }
 
-    // First-fit: walk the list in address order, split the winning block if
-    // the remainder is big enough to be worth tracking on its own.
-    fn alloc(&mut self, req: i32) -> Option<i32> {
+    // Walk the free list once, picking the winning block per the active
+    // placement policy: first fit early-exits, best/worst scan everything.
+    fn find_fit(&self, req: i32) -> Option<usize> {
         let mut cur = self.head;
+        let mut best: Option<usize> = None;
         while let Some(idx) = cur {
             let blk = &self.blocks[idx];
-            cur = blk.next;
-            if blk.used || blk.size < req {
-                continue;
-            }
-
-            let addr = blk.addr;
-            let remainder = blk.size - req;
-            self.blocks[idx].used = true;
-
-            if remainder >= MIN_SPLIT {
-                let old_next = self.blocks[idx].next;
-                self.blocks[idx].size = req;
-
-                let new_idx = self.blocks.len();
-                self.blocks.push(Block {
-                    addr: addr + req,
-                    size: remainder,
-                    used: false,
-                    prev: Some(idx),
-                    next: old_next,
-                });
-                self.blocks[idx].next = Some(new_idx);
-                if let Some(n) = old_next {
-                    self.blocks[n].prev = Some(new_idx);
+            if !blk.used && blk.size >= req {
+                match self.strategy {
+                    Strategy::First => return Some(idx),
+                    Strategy::Best => {
+                        if best.map_or(true, |b| blk.size < self.blocks[b].size) {
+                            best = Some(idx);
+                        }
+                    }
+                    Strategy::Worst => {
+                        if best.map_or(true, |b| blk.size > self.blocks[b].size) {
+                            best = Some(idx);
+                        }
+                    }
                 }
             }
-
-            return Some(addr);
+            cur = blk.next;
         }
-        None
+        best
+    }
+
+    fn alloc(&mut self, req: i32) -> Option<i32> {
+        let idx = self.find_fit(req)?;
+        let addr = self.blocks[idx].addr;
+        let remainder = self.blocks[idx].size - req;
+        self.blocks[idx].used = true;
+
+        if remainder >= MIN_SPLIT {
+            let old_next = self.blocks[idx].next;
+            self.blocks[idx].size = req;
+
+            let new_idx = self.blocks.len();
+            self.blocks.push(Block {
+                addr: addr + req,
+                size: remainder,
+                used: false,
+                prev: Some(idx),
+                next: old_next,
+            });
+            self.blocks[idx].next = Some(new_idx);
+            if let Some(n) = old_next {
+                self.blocks[n].prev = Some(new_idx);
+            }
+        }
+
+        Some(addr)
     }
 
     fn free(&mut self, addr: i32) -> bool {
@@ -120,11 +144,13 @@ impl Allocator {
         }
     }
 
-    fn print_blocks(&self) {
+    fn print_freelist(&self) {
         let mut cur = self.head;
         while let Some(idx) = cur {
             let b = &self.blocks[idx];
-            println!("{}:{}:{}", b.addr, b.size, if b.used { "used" } else { "free" });
+            if !b.used {
+                println!("{}:{}", b.addr, b.size);
+            }
             cur = b.next;
         }
     }
@@ -145,7 +171,12 @@ fn main() {
         match spl[0] {
             "INIT" => {
                 let size = spl[1].parse::<i32>().unwrap();
-                alloc.init(size);
+                let strategy = match spl.get(2) {
+                    Some(&"BEST") => Strategy::Best,
+                    Some(&"WORST") => Strategy::Worst,
+                    _ => Strategy::First,
+                };
+                alloc.init(size, strategy);
                 println!("OK");
             }
             "ALLOC" => {
@@ -163,7 +194,7 @@ fn main() {
                     println!("BAD");
                 }
             }
-            "BLOCKS" => alloc.print_blocks(),
+            "FREELIST" => alloc.print_freelist(),
             _ => println!("POOP"),
         }
     }
