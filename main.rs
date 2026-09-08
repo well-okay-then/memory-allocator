@@ -108,12 +108,14 @@ impl Allocator {
     // Boundary tags are what make this O(1) in a real allocator: the footer
     // just behind a block's header names its neighbor directly instead of
     // requiring a scan. Our arena's prev/next links serve that same role
-    // here, since the list is always kept in address order.
+    // here, since the list is always kept in address order. Merging two
+    // blocks also erases the boundary between them (one header+footer pair),
+    // so that OVERHEAD comes back as usable payload on top of both sizes.
     fn coalesce(&mut self, idx: usize) {
         if let Some(next_idx) = self.blocks[idx].next {
             if !self.blocks[next_idx].used {
                 let next_next = self.blocks[next_idx].next;
-                self.blocks[idx].size += self.blocks[next_idx].size;
+                self.blocks[idx].size += self.blocks[next_idx].size + OVERHEAD;
                 self.blocks[idx].next = next_next;
                 if let Some(n) = next_next {
                     self.blocks[n].prev = Some(idx);
@@ -124,7 +126,7 @@ impl Allocator {
         if let Some(prev_idx) = self.blocks[idx].prev {
             if !self.blocks[prev_idx].used {
                 let idx_next = self.blocks[idx].next;
-                self.blocks[prev_idx].size += self.blocks[idx].size;
+                self.blocks[prev_idx].size += self.blocks[idx].size + OVERHEAD;
                 self.blocks[prev_idx].next = idx_next;
                 if let Some(n) = idx_next {
                     self.blocks[n].prev = Some(prev_idx);
