@@ -1,13 +1,9 @@
 use std::io::{self, BufRead};
 
+const HEADER: i32 = 8;
+const FOOTER: i32 = 8;
+const OVERHEAD: i32 = HEADER + FOOTER;
 const MIN_SPLIT: i32 = 16;
-
-#[derive(Clone, Copy)]
-enum Strategy {
-    First,
-    Best,
-    Worst,
-}
 
 struct Block {
     addr: i32,
@@ -20,7 +16,6 @@ struct Block {
 struct Allocator {
     blocks: Vec<Block>,
     head: Option<usize>,
-    strategy: Strategy,
 }
 
 impl Allocator {
@@ -28,18 +23,17 @@ impl Allocator {
         Allocator {
             blocks: Vec::new(),
             head: None,
-            strategy: Strategy::First,
         }
     }
 
-    fn init(&mut self, size: i32, strategy: Strategy) {
+    fn init(&mut self, size: i32) {
         self.blocks.clear();
         self.head = None;
-        self.strategy = strategy;
-        if size > 0 {
+        let usable = size - OVERHEAD;
+        if usable > 0 {
             self.blocks.push(Block {
-                addr: 0,
-                size,
+                addr: HEADER,
+                size: usable,
                 used: false,
                 prev: None,
                 next: None,
@@ -48,78 +42,73 @@ impl Allocator {
         }
     }
 
-    // Walk the free list once, picking the winning block per the active
-    // placement policy: first fit early-exits, best/worst scan everything.
-    fn find_fit(&self, req: i32) -> Option<usize> {
-        let mut cur = self.head;
-        let mut best: Option<usize> = None;
-        while let Some(idx) = cur {
-            let blk = &self.blocks[idx];
-            if !blk.used && blk.size >= req {
-                match self.strategy {
-                    Strategy::First => return Some(idx),
-                    Strategy::Best => {
-                        if best.map_or(true, |b| blk.size < self.blocks[b].size) {
-                            best = Some(idx);
-                        }
-                    }
-                    Strategy::Worst => {
-                        if best.map_or(true, |b| blk.size > self.blocks[b].size) {
-                            best = Some(idx);
-                        }
-                    }
-                }
-            }
-            cur = blk.next;
-        }
-        best
-    }
-
-    fn alloc(&mut self, req: i32) -> Option<i32> {
-        let idx = self.find_fit(req)?;
-        let addr = self.blocks[idx].addr;
-        let remainder = self.blocks[idx].size - req;
-        self.blocks[idx].used = true;
-
-        if remainder >= MIN_SPLIT {
-            let old_next = self.blocks[idx].next;
-            self.blocks[idx].size = req;
-
-            let new_idx = self.blocks.len();
-            self.blocks.push(Block {
-                addr: addr + req,
-                size: remainder,
-                used: false,
-                prev: Some(idx),
-                next: old_next,
-            });
-            self.blocks[idx].next = Some(new_idx);
-            if let Some(n) = old_next {
-                self.blocks[n].prev = Some(new_idx);
-            }
-        }
-
-        Some(addr)
-    }
-
-    fn free(&mut self, addr: i32) -> bool {
+    fn find_idx(&self, addr: i32) -> Option<usize> {
         let mut cur = self.head;
         while let Some(idx) = cur {
             if self.blocks[idx].addr == addr {
-                if !self.blocks[idx].used {
-                    return false;
-                }
-                self.blocks[idx].used = false;
-                self.coalesce(idx);
-                return true;
+                return Some(idx);
             }
             cur = self.blocks[idx].next;
         }
-        false
+        None
     }
 
-    // Absorb free neighbors into `idx` (next first, then prev) so runs of
-    // adjacent free blocks always collapse to a single list node.
+    // Every carved-off block now costs a real header+footer (boundary tags),
+    // so only split when the leftover still covers that overhead plus a
+    // worthwhile payload — otherwise the free remainder becomes internal
+    // fragmentation inside the used block, same spirit as the plain MIN_SPLIT
+    // rule from the splitting lesson.
+    fn alloc(&mut self, req: i32) -> Option<i32> {
+        let mut cur = self.head;
+        while let Some(idx) = cur {
+            let blk = &self.blocks[idx];
+            cur = blk.next;
+            if blk.used || blk.size < req {
+                continue;
+            }
+
+            let addr = blk.addr;
+            let leftover = blk.size - req;
+            self.blocks[idx].used = true;
+
+            if leftover - OVERHEAD >= MIN_SPLIT {
+                let old_next = self.blocks[idx].next;
+                self.blocks[idx].size = req;
+
+                let new_idx = self.blocks.len();
+                self.blocks.push(Block {
+                    addr: addr + req + OVERHEAD,
+                    size: leftover - OVERHEAD,
+                    used: false,
+                    prev: Some(idx),
+                    next: old_next,
+                });
+                self.blocks[idx].next = Some(new_idx);
+                if let Some(n) = old_next {
+                    self.blocks[n].prev = Some(new_idx);
+                }
+            }
+
+            return Some(addr);
+        }
+        None
+    }
+
+    fn free(&mut self, addr: i32) -> bool {
+        match self.find_idx(addr) {
+            Some(idx) if self.blocks[idx].used => {
+                self.blocks[idx].used = false;
+                self.coalesce(idx);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    // Boundary tags are what make this O(1) in a real allocator: the footer
+    // just behind a block's header names its neighbor directly instead of
+    // requiring a scan. Our arena's prev/next links serve that same role
+    // here, since the list is always kept in address order.
     fn coalesce(&mut self, idx: usize) {
         if let Some(next_idx) = self.blocks[idx].next {
             if !self.blocks[next_idx].used {
@@ -144,15 +133,27 @@ impl Allocator {
         }
     }
 
-    fn print_freelist(&self) {
+    fn describe(&self, idx: usize) -> String {
+        let b = &self.blocks[idx];
+        format!("{}:{}:{}", b.addr, b.size, if b.used { "used" } else { "free" })
+    }
+
+    fn print_blocks(&self) {
         let mut cur = self.head;
         while let Some(idx) = cur {
-            let b = &self.blocks[idx];
-            if !b.used {
-                println!("{}:{}", b.addr, b.size);
-            }
-            cur = b.next;
+            println!("{}", self.describe(idx));
+            cur = self.blocks[idx].next;
         }
+    }
+
+    fn count(&self) -> usize {
+        let mut cur = self.head;
+        let mut n = 0;
+        while let Some(idx) = cur {
+            n += 1;
+            cur = self.blocks[idx].next;
+        }
+        n
     }
 }
 
@@ -171,12 +172,7 @@ fn main() {
         match spl[0] {
             "INIT" => {
                 let size = spl[1].parse::<i32>().unwrap();
-                let strategy = match spl.get(2) {
-                    Some(&"BEST") => Strategy::Best,
-                    Some(&"WORST") => Strategy::Worst,
-                    _ => Strategy::First,
-                };
-                alloc.init(size, strategy);
+                alloc.init(size);
                 println!("OK");
             }
             "ALLOC" => {
@@ -194,7 +190,28 @@ fn main() {
                     println!("BAD");
                 }
             }
-            "FREELIST" => alloc.print_freelist(),
+            "BLOCKS" => alloc.print_blocks(),
+            "COUNT" => println!("{}", alloc.count()),
+            "PREV" => {
+                let addr = spl[1].parse::<i32>().unwrap();
+                match alloc.find_idx(addr) {
+                    None => println!("BAD"),
+                    Some(idx) => match alloc.blocks[idx].prev {
+                        None => println!("NONE"),
+                        Some(p) => println!("{}", alloc.describe(p)),
+                    },
+                }
+            }
+            "NEXT" => {
+                let addr = spl[1].parse::<i32>().unwrap();
+                match alloc.find_idx(addr) {
+                    None => println!("BAD"),
+                    Some(idx) => match alloc.blocks[idx].next {
+                        None => println!("NONE"),
+                        Some(n) => println!("{}", alloc.describe(n)),
+                    },
+                }
+            }
             _ => println!("POOP"),
         }
     }
