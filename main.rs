@@ -26,7 +26,7 @@ fn main() {
             }
             "ALLOC" => {
                 let t = spl[1].parse::<i32>().unwrap();
-                if !addr_to_size.is_empty() {
+                if !addr_to_size.is_empty() || head_size + size < t {
                     println!("OOM");
                 } else {
                     cur += head_size;
