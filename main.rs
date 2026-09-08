@@ -86,11 +86,38 @@ impl Allocator {
                     return false;
                 }
                 self.blocks[idx].used = false;
+                self.coalesce(idx);
                 return true;
             }
             cur = self.blocks[idx].next;
         }
         false
+    }
+
+    // Absorb free neighbors into `idx` (next first, then prev) so runs of
+    // adjacent free blocks always collapse to a single list node.
+    fn coalesce(&mut self, idx: usize) {
+        if let Some(next_idx) = self.blocks[idx].next {
+            if !self.blocks[next_idx].used {
+                let next_next = self.blocks[next_idx].next;
+                self.blocks[idx].size += self.blocks[next_idx].size;
+                self.blocks[idx].next = next_next;
+                if let Some(n) = next_next {
+                    self.blocks[n].prev = Some(idx);
+                }
+            }
+        }
+
+        if let Some(prev_idx) = self.blocks[idx].prev {
+            if !self.blocks[prev_idx].used {
+                let idx_next = self.blocks[idx].next;
+                self.blocks[prev_idx].size += self.blocks[idx].size;
+                self.blocks[prev_idx].next = idx_next;
+                if let Some(n) = idx_next {
+                    self.blocks[n].prev = Some(prev_idx);
+                }
+            }
+        }
     }
 
     fn print_blocks(&self) {
