@@ -1,72 +1,143 @@
-use std::{
-    collections::BTreeMap,
-    io::{self, BufRead},
-};
+use std::io::{self, BufRead};
 
-// TODO (why-allocator): implement per the lesson description.
+const HEAD_SIZE: i32 = 8;
+const MIN_SPLIT: i32 = 16;
+
+struct Block {
+    addr: i32,
+    size: i32,
+    used: bool,
+    prev: Option<usize>,
+    next: Option<usize>,
+}
+
+struct Allocator {
+    blocks: Vec<Block>,
+    head: Option<usize>,
+}
+
+impl Allocator {
+    fn new() -> Self {
+        Allocator {
+            blocks: Vec::new(),
+            head: None,
+        }
+    }
+
+    fn init(&mut self, size: i32) {
+        self.blocks.clear();
+        self.head = None;
+        let usable = size - HEAD_SIZE;
+        if usable > 0 {
+            self.blocks.push(Block {
+                addr: HEAD_SIZE,
+                size: usable,
+                used: false,
+                prev: None,
+                next: None,
+            });
+            self.head = Some(0);
+        }
+    }
+
+    // First-fit: walk the list in address order, split the winning block if
+    // the remainder is big enough to be worth tracking on its own.
+    fn alloc(&mut self, req: i32) -> Option<i32> {
+        let mut cur = self.head;
+        while let Some(idx) = cur {
+            let blk = &self.blocks[idx];
+            cur = blk.next;
+            if blk.used || blk.size < req {
+                continue;
+            }
+
+            let addr = blk.addr;
+            let remainder = blk.size - req;
+            self.blocks[idx].used = true;
+
+            if remainder >= MIN_SPLIT {
+                let old_next = self.blocks[idx].next;
+                self.blocks[idx].size = req;
+
+                let new_idx = self.blocks.len();
+                self.blocks.push(Block {
+                    addr: addr + req,
+                    size: remainder,
+                    used: false,
+                    prev: Some(idx),
+                    next: old_next,
+                });
+                self.blocks[idx].next = Some(new_idx);
+                if let Some(n) = old_next {
+                    self.blocks[n].prev = Some(new_idx);
+                }
+            }
+
+            return Some(addr);
+        }
+        None
+    }
+
+    fn free(&mut self, addr: i32) -> bool {
+        let mut cur = self.head;
+        while let Some(idx) = cur {
+            if self.blocks[idx].addr == addr {
+                if !self.blocks[idx].used {
+                    return false;
+                }
+                self.blocks[idx].used = false;
+                return true;
+            }
+            cur = self.blocks[idx].next;
+        }
+        false
+    }
+
+    fn print_blocks(&self) {
+        let mut cur = self.head;
+        while let Some(idx) = cur {
+            let b = &self.blocks[idx];
+            println!("{}:{}:{}", b.addr, b.size, if b.used { "used" } else { "free" });
+            cur = b.next;
+        }
+    }
+}
 
 fn main() {
     let stdin = io::stdin();
-    let mut size = 0;
-    let mut cur = 0;
-    let head_size = 8;
-    let mut addr_to_size = BTreeMap::new();
+    let mut alloc = Allocator::new();
+
     for line in stdin.lock().lines() {
         let l = line.unwrap();
         if l.is_empty() {
             continue;
         }
 
-        let spl: Vec<&str> = l.split(" ").collect();
+        let spl: Vec<&str> = l.split(' ').collect();
 
         match spl[0] {
             "INIT" => {
-                size = spl[1].parse::<i32>().unwrap();
+                let size = spl[1].parse::<i32>().unwrap();
+                alloc.init(size);
                 println!("OK");
             }
             "ALLOC" => {
                 let t = spl[1].parse::<i32>().unwrap();
-                if !addr_to_size.is_empty() || head_size + size < t {
-                    println!("OOM");
-                } else {
-                    cur += head_size;
-                    let addr = cur;
-                    println!("{}", cur);
-                    cur += t;
-                    addr_to_size.insert(
-                        addr,
-                        Mem {
-                            size: t,
-                            free: false,
-                        },
-                    );
+                match alloc.alloc(t) {
+                    Some(addr) => println!("{}", addr),
+                    None => println!("OOM"),
                 }
             }
             "FREE" => {
                 let addr = spl[1].parse::<i32>().unwrap();
-                if addr_to_size.contains_key(&addr) {
-                    let s = addr_to_size.get(&addr).unwrap().size;
-                    cur -= s;
-                    cur -= head_size;
-                    addr_to_size.remove(&addr);
-                    println!("OK")
+                if alloc.free(addr) {
+                    println!("OK");
                 } else {
-                    println!("BAD")
+                    println!("BAD");
                 }
             }
-            "FREELIST" => {
-                if addr_to_size.is_empty() {
-                    println!("{}:{}", head_size, size - head_size)
-                }
-            }
-            _ => {
-                println!("POOP")
-            }
+            "BLOCKS" => alloc.print_blocks(),
+            _ => println!("POOP"),
         }
     }
-}
-
-struct Mem {
-    size: i32,
-    free: bool,
 }
