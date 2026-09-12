@@ -1,121 +1,108 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead};
 
-// Smallest k such that 2^k >= size (size 0 or 1 both need order 0).
-fn order_for(size: i64) -> i32 {
-    let mut k: i32 = 0;
-    while (1i64 << k) < size {
-        k += 1;
-    }
-    k
+struct Slab {
+    used: Vec<bool>,
+    free_count: i32,
 }
 
-struct Buddy {
-    max_order: i32,
-    free_lists: Vec<Vec<i64>>,
-    used: HashMap<i64, i32>,
+impl Slab {
+    fn new(cap: i32) -> Self {
+        Slab {
+            used: vec![false; cap as usize],
+            free_count: cap,
+        }
+    }
 }
 
-impl Buddy {
-    fn new() -> Self {
-        Buddy {
-            max_order: -1,
-            free_lists: Vec::new(),
-            used: HashMap::new(),
+#[allow(dead_code)]
+struct Cache {
+    obj_size: i64,
+    objs_per_slab: i32,
+    slabs: Vec<Slab>,
+    objs_alloc: i64,
+}
+
+impl Cache {
+    fn new(obj_size: i64, objs_per_slab: i32) -> Self {
+        Cache {
+            obj_size,
+            objs_per_slab,
+            slabs: Vec::new(),
+            objs_alloc: 0,
         }
     }
 
-    fn init(&mut self, order: i32) {
-        self.max_order = order;
-        self.free_lists = vec![Vec::new(); (order + 1) as usize];
-        self.used.clear();
-        self.free_lists[order as usize].push(0);
-    }
-
-    // Find the smallest free block whose order can satisfy `req`, then
-    // repeatedly split it in half — stashing the unused buddy at each
-    // level's free list — until it's exactly the requested order.
-    fn alloc(&mut self, size: i64) -> Option<i64> {
-        let req = order_for(size.max(1));
-        if req > self.max_order {
-            return None;
-        }
-
-        let mut f = req;
-        while f <= self.max_order && self.free_lists[f as usize].is_empty() {
-            f += 1;
-        }
-        if f > self.max_order {
-            return None;
-        }
-
-        let idx = self.free_lists[f as usize]
-            .iter()
-            .enumerate()
-            .min_by_key(|&(_, &a)| a)
-            .map(|(i, _)| i)
-            .unwrap();
-        let addr = self.free_lists[f as usize].remove(idx);
-
-        let mut order = f;
-        while order > req {
-            order -= 1;
-            let buddy_addr = addr + (1i64 << order);
-            self.free_lists[order as usize].push(buddy_addr);
-        }
-
-        self.used.insert(addr, req);
-        Some(addr)
-    }
-
-    // Coalesce with the buddy while it's free, walking up toward max_order.
-    fn free(&mut self, addr: i64) -> bool {
-        let order = match self.used.remove(&addr) {
-            Some(o) => o,
-            None => return false,
-        };
-
-        let mut cur_addr = addr;
-        let mut cur_order = order;
-        while cur_order < self.max_order {
-            let buddy_addr = cur_addr ^ (1i64 << cur_order);
-            let list = &mut self.free_lists[cur_order as usize];
-            match list.iter().position(|&a| a == buddy_addr) {
-                Some(pos) => {
-                    list.remove(pos);
-                    cur_addr = cur_addr.min(buddy_addr);
-                    cur_order += 1;
-                }
-                None => break,
+    // Reuse the first slab (in creation order) that has room before
+    // minting a new one, and within a slab always take the lowest free
+    // object index — a deterministic, easy-to-reason-about placement.
+    fn alloc(&mut self) -> (i32, i32) {
+        for (i, slab) in self.slabs.iter_mut().enumerate() {
+            if slab.free_count > 0 {
+                let j = slab.used.iter().position(|&u| !u).unwrap();
+                slab.used[j] = true;
+                slab.free_count -= 1;
+                self.objs_alloc += 1;
+                return (i as i32, j as i32);
             }
         }
 
-        self.free_lists[cur_order as usize].push(cur_addr);
+        let mut slab = Slab::new(self.objs_per_slab);
+        slab.used[0] = true;
+        slab.free_count -= 1;
+        self.slabs.push(slab);
+        self.objs_alloc += 1;
+        ((self.slabs.len() - 1) as i32, 0)
+    }
+
+    fn free(&mut self, slab_idx: i32, obj_idx: i32) -> bool {
+        if slab_idx < 0 || slab_idx as usize >= self.slabs.len() {
+            return false;
+        }
+        let slab = &mut self.slabs[slab_idx as usize];
+        if obj_idx < 0 || obj_idx as usize >= slab.used.len() {
+            return false;
+        }
+        if !slab.used[obj_idx as usize] {
+            return false;
+        }
+        slab.used[obj_idx as usize] = false;
+        slab.free_count += 1;
+        self.objs_alloc -= 1;
         true
     }
 
-    fn print_freelist(&self, order: i32) {
-        if order < 0 || order > self.max_order {
-            return;
-        }
-        let mut addrs = self.free_lists[order as usize].clone();
-        addrs.sort();
-        // Always emit output for a valid order: one line per free block,
-        // or a single blank line when the list is empty. The command still
-        // "ran" and produced a (possibly empty) result line.
-        if addrs.is_empty() {
-            println!();
-        } else {
-            for a in addrs {
-                println!("{}", a);
+    // A slab is empty (no objects in use), full (no room left), or
+    // partial (some of each) — the three buckets a slab cache reports so
+    // callers can see how much reclaimable memory is sitting idle.
+    fn stats(&self) -> String {
+        let mut empty = 0;
+        let mut partial = 0;
+        let mut full = 0;
+        for slab in &self.slabs {
+            let used = self.objs_per_slab - slab.free_count;
+            if used == 0 {
+                empty += 1;
+            } else if used == self.objs_per_slab {
+                full += 1;
+            } else {
+                partial += 1;
             }
         }
+        format!(
+            "objs_alloc={} slabs={} empty={} partial={} full={}",
+            self.objs_alloc,
+            self.slabs.len(),
+            empty,
+            partial,
+            full
+        )
     }
 }
 
 fn main() {
     let stdin = io::stdin();
-    let mut buddy = Buddy::new();
+    let mut caches: HashMap<String, Cache> = HashMap::new();
 
     for line in stdin.lock().lines() {
         let l = line.unwrap();
@@ -126,38 +113,44 @@ fn main() {
         let spl: Vec<&str> = l.split(' ').collect();
 
         match spl[0] {
-            "INIT" => {
-                let order = spl[1].parse::<i32>().unwrap();
-                buddy.init(order);
+            "CACHE_CREATE" => {
+                let name = spl[1].to_string();
+                let obj_size = spl[2].parse::<i64>().unwrap();
+                let objs_per_slab = spl[3].parse::<i32>().unwrap();
+                caches.insert(name, Cache::new(obj_size, objs_per_slab));
                 println!("OK");
             }
-            "ORDER" => {
-                let size = spl[1].parse::<i64>().unwrap();
-                println!("{}", order_for(size.max(1)));
-            }
             "ALLOC" => {
-                let size = spl[1].parse::<i64>().unwrap();
-                match buddy.alloc(size) {
-                    Some(addr) => println!("{}", addr),
-                    None => println!("OOM"),
+                let name = spl[1];
+                match caches.get_mut(name) {
+                    Some(cache) => {
+                        let (slab_idx, obj_idx) = cache.alloc();
+                        println!("{}:{}", slab_idx, obj_idx);
+                    }
+                    None => println!("BAD"),
                 }
             }
             "FREE" => {
-                let addr = spl[1].parse::<i64>().unwrap();
-                if buddy.free(addr) {
-                    println!("OK");
-                } else {
-                    println!("BAD");
+                let name = spl[1];
+                let slab_idx = spl[2].parse::<i32>().unwrap();
+                let obj_idx = spl[3].parse::<i32>().unwrap();
+                match caches.get_mut(name) {
+                    Some(cache) => {
+                        if cache.free(slab_idx, obj_idx) {
+                            println!("OK");
+                        } else {
+                            println!("BAD");
+                        }
+                    }
+                    None => println!("BAD"),
                 }
             }
-            "FREELIST" => {
-                let order = spl[1].parse::<i32>().unwrap();
-                buddy.print_freelist(order);
-            }
-            "BUDDY" => {
-                let addr = spl[1].parse::<i64>().unwrap();
-                let order = spl[2].parse::<i32>().unwrap();
-                println!("{}", addr ^ (1i64 << order));
+            "STATS" => {
+                let name = spl[1];
+                match caches.get(name) {
+                    Some(cache) => println!("{}", cache.stats()),
+                    None => println!("BAD"),
+                }
             }
             _ => println!("POOP"),
         }
