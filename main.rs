@@ -100,8 +100,15 @@ impl Buddy {
         }
         let mut addrs = self.free_lists[order as usize].clone();
         addrs.sort();
-        for a in addrs {
-            println!("{}", a);
+        // Always emit output for a valid order: one line per free block,
+        // or a single blank line when the list is empty. The command still
+        // "ran" and produced a (possibly empty) result line.
+        if addrs.is_empty() {
+            println!();
+        } else {
+            for a in addrs {
+                println!("{}", a);
+            }
         }
     }
 }
