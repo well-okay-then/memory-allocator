@@ -49,6 +49,18 @@ fn main() {
                     println!("flush");
                 }
             }
+            "STATS" => {
+                let thread = spl[1].parse::<i64>().unwrap();
+                let mut classes: Vec<(i64, i32)> = local
+                    .iter()
+                    .filter(|&(&(t, _), _)| t == thread)
+                    .map(|(&(_, size), &count)| (size, count))
+                    .collect();
+                classes.sort_by_key(|&(size, _)| size);
+                for (size, count) in classes {
+                    println!("class={}:{}", size, count);
+                }
+            }
             _ => println!("POOP"),
         }
     }
