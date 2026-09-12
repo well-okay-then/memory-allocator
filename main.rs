@@ -53,6 +53,8 @@ fn classify(desc: &str) -> &'static str {
         "per-frame",
         "per frame",
         "frame",
+        "parser",
+        "parsing",
         "transient",
         "scratch",
         "temporary",
