@@ -147,6 +147,11 @@ fn main() {
                 let order = spl[1].parse::<i32>().unwrap();
                 buddy.print_freelist(order);
             }
+            "BUDDY" => {
+                let addr = spl[1].parse::<i64>().unwrap();
+                let order = spl[2].parse::<i32>().unwrap();
+                println!("{}", addr ^ (1i64 << order));
+            }
             _ => println!("POOP"),
         }
     }
