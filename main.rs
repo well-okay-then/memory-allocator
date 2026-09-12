@@ -1,60 +1,114 @@
+use std::collections::HashMap;
 use std::io::{self, BufRead};
 
-const CLASSES: [i32; 7] = [16, 32, 64, 128, 256, 512, 1024];
-
-struct SizeClasses {
-    alloc: [i32; 7],
-    free: [i32; 7],
+// Smallest k such that 2^k >= size (size 0 or 1 both need order 0).
+fn order_for(size: i64) -> i32 {
+    let mut k: i32 = 0;
+    while (1i64 << k) < size {
+        k += 1;
+    }
+    k
 }
 
-impl SizeClasses {
+struct Buddy {
+    max_order: i32,
+    free_lists: Vec<Vec<i64>>,
+    used: HashMap<i64, i32>,
+}
+
+impl Buddy {
     fn new() -> Self {
-        SizeClasses {
-            alloc: [0; 7],
-            free: [0; 7],
+        Buddy {
+            max_order: -1,
+            free_lists: Vec::new(),
+            used: HashMap::new(),
         }
     }
 
-    fn class_for(size: i32) -> Option<usize> {
-        CLASSES.iter().position(|&c| c >= size)
+    fn init(&mut self, order: i32) {
+        self.max_order = order;
+        self.free_lists = vec![Vec::new(); (order + 1) as usize];
+        self.used.clear();
+        self.free_lists[order as usize].push(0);
     }
 
-    fn index_of(class: i32) -> Option<usize> {
-        CLASSES.iter().position(|&c| c == class)
-    }
-
-    // Reuse a freed block from the class's own free list before minting a
-    // new one, so a free/alloc round-trip never fabricates phantom objects.
-    fn alloc(&mut self, size: i32) -> Option<i32> {
-        let idx = Self::class_for(size)?;
-        if self.free[idx] > 0 {
-            self.free[idx] -= 1;
+    // Find the smallest free block whose order can satisfy `req`, then
+    // repeatedly split it in half — stashing the unused buddy at each
+    // level's free list — until it's exactly the requested order.
+    fn alloc(&mut self, size: i64) -> Option<i64> {
+        let req = order_for(size.max(1));
+        if req > self.max_order {
+            return None;
         }
-        self.alloc[idx] += 1;
-        Some(CLASSES[idx])
+
+        let mut f = req;
+        while f <= self.max_order && self.free_lists[f as usize].is_empty() {
+            f += 1;
+        }
+        if f > self.max_order {
+            return None;
+        }
+
+        let idx = self.free_lists[f as usize]
+            .iter()
+            .enumerate()
+            .min_by_key(|&(_, &a)| a)
+            .map(|(i, _)| i)
+            .unwrap();
+        let addr = self.free_lists[f as usize].remove(idx);
+
+        let mut order = f;
+        while order > req {
+            order -= 1;
+            let buddy_addr = addr + (1i64 << order);
+            self.free_lists[order as usize].push(buddy_addr);
+        }
+
+        self.used.insert(addr, req);
+        Some(addr)
     }
 
-    fn free(&mut self, class: i32) -> bool {
-        match Self::index_of(class) {
-            Some(idx) if self.alloc[idx] > 0 => {
-                self.alloc[idx] -= 1;
-                self.free[idx] += 1;
-                true
+    // Coalesce with the buddy while it's free, walking up toward max_order.
+    fn free(&mut self, addr: i64) -> bool {
+        let order = match self.used.remove(&addr) {
+            Some(o) => o,
+            None => return false,
+        };
+
+        let mut cur_addr = addr;
+        let mut cur_order = order;
+        while cur_order < self.max_order {
+            let buddy_addr = cur_addr ^ (1i64 << cur_order);
+            let list = &mut self.free_lists[cur_order as usize];
+            match list.iter().position(|&a| a == buddy_addr) {
+                Some(pos) => {
+                    list.remove(pos);
+                    cur_addr = cur_addr.min(buddy_addr);
+                    cur_order += 1;
+                }
+                None => break,
             }
-            _ => false,
         }
+
+        self.free_lists[cur_order as usize].push(cur_addr);
+        true
     }
 
-    fn print_stats(&self) {
-        for i in 0..CLASSES.len() {
-            println!("{}:alloc={}:free={}", CLASSES[i], self.alloc[i], self.free[i]);
+    fn print_freelist(&self, order: i32) {
+        if order < 0 || order > self.max_order {
+            return;
+        }
+        let mut addrs = self.free_lists[order as usize].clone();
+        addrs.sort();
+        for a in addrs {
+            println!("{}", a);
         }
     }
 }
 
 fn main() {
     let stdin = io::stdin();
-    let mut sc = SizeClasses::new();
+    let mut buddy = Buddy::new();
 
     for line in stdin.lock().lines() {
         let l = line.unwrap();
@@ -65,22 +119,34 @@ fn main() {
         let spl: Vec<&str> = l.split(' ').collect();
 
         match spl[0] {
+            "INIT" => {
+                let order = spl[1].parse::<i32>().unwrap();
+                buddy.init(order);
+                println!("OK");
+            }
+            "ORDER" => {
+                let size = spl[1].parse::<i64>().unwrap();
+                println!("{}", order_for(size.max(1)));
+            }
             "ALLOC" => {
-                let size = spl[1].parse::<i32>().unwrap();
-                match sc.alloc(size) {
-                    Some(class) => println!("class={}", class),
-                    None => println!("TOO_LARGE"),
+                let size = spl[1].parse::<i64>().unwrap();
+                match buddy.alloc(size) {
+                    Some(addr) => println!("{}", addr),
+                    None => println!("OOM"),
                 }
             }
             "FREE" => {
-                let class = spl[1].parse::<i32>().unwrap();
-                if sc.free(class) {
+                let addr = spl[1].parse::<i64>().unwrap();
+                if buddy.free(addr) {
                     println!("OK");
                 } else {
                     println!("BAD");
                 }
             }
-            "STATS" => sc.print_stats(),
+            "FREELIST" => {
+                let order = spl[1].parse::<i32>().unwrap();
+                buddy.print_freelist(order);
+            }
             _ => println!("POOP"),
         }
     }
