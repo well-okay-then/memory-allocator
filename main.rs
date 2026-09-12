@@ -53,14 +53,32 @@ fn classify(desc: &str) -> &'static str {
         "per-frame",
         "per frame",
         "frame",
-        "parser",
-        "parsing",
         "transient",
         "scratch",
         "temporary",
-        "bump allocat",
         "arena",
         "request-scoped",
+        "phase",
+        "freed together",
+        "region allocat",
+    ];
+    // Distinct from arena: bump allocators never individually free at
+    // all — they just grow monotonically until the whole thing is
+    // discarded (or the process exits), rather than freeing a batch at
+    // the end of a phase.
+    let bump_kw = [
+        "never free",
+        "never frees",
+        "no frees",
+        "doesn't free",
+        "does not free",
+        "never deallocat",
+        "one-shot",
+        "one shot",
+        "monotonic",
+        "pointer bump",
+        "bump allocat",
+        "bump",
     ];
     let default_kw = [
         "general-purpose",
@@ -76,10 +94,11 @@ fn classify(desc: &str) -> &'static str {
 
     // Iterator::max_by_key keeps the *last* of equally-scored candidates,
     // so this is listed lowest-priority-first: on a tie, slab beats
-    // tcmalloc beats buddy beats arena beats default.
-    let candidates: [(&str, usize); 5] = [
+    // tcmalloc beats buddy beats bump beats arena beats default.
+    let candidates: [(&str, usize); 6] = [
         ("default", score(&default_kw)),
         ("arena", score(&arena_kw)),
+        ("bump", score(&bump_kw)),
         ("buddy", score(&buddy_kw)),
         ("tcmalloc", score(&tcmalloc_kw)),
         ("slab", score(&slab_kw)),
