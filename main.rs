@@ -1,124 +1,114 @@
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead};
 
-// Keyword-based classifier: match a one-line workload description to the
-// real-world allocator strategy best suited to it. Each list holds
-// substrings (checked case-insensitively) that are strong signals for
-// that strategy; the strategy with the most hits wins, ties broken by
-// list order below, and no hits at all falls back to "default".
-fn classify(desc: &str) -> &'static str {
-    let d = desc.to_lowercase();
+const CLASSES: [i64; 8] = [16, 32, 64, 128, 256, 512, 1024, 2048];
+const TOTAL_HEAP: i64 = 32768;
 
-    let slab_kw = [
-        "dentry",
-        "inode",
-        "task_struct",
-        "kernel object",
-        "object cache",
-        "fixed-size object",
-        "fixed size object",
-        "same-size",
-        "same size",
-        "object pool",
-        "packet buffer",
-        "network packet",
-        "slab",
-    ];
-    let tcmalloc_kw = [
-        "thread",
-        "threads",
-        "threaded",
-        "concurrent",
-        "concurrency",
-        "multi-threaded",
-        "multithreaded",
-        "parallel",
-        "per-cpu",
-        "lock contention",
-        "lock-free",
-        "tcmalloc",
-    ];
-    let buddy_kw = [
-        "physical page",
-        "physical memory page",
-        "power-of-two",
-        "power of two",
-        "buddy system",
-        "buddy allocator",
-        "page allocator",
-        "virtual memory page",
-    ];
-    let arena_kw = [
-        "short-lived",
-        "short lived",
-        "per-frame",
-        "per frame",
-        "frame",
-        "parser",
-        "parsing",
-        "transient",
-        "scratch",
-        "temporary",
-        "arena",
-        "request-scoped",
-        "phase",
-        "freed together",
-        "region allocat",
-    ];
-    // Distinct from arena: bump allocators never individually free at
-    // all — they just grow monotonically until the whole thing is
-    // discarded (or the process exits), rather than freeing a batch at
-    // the end of a phase.
-    let bump_kw = [
-        "never free",
-        "never frees",
-        "no frees",
-        "doesn't free",
-        "does not free",
-        "never deallocat",
-        "one-shot",
-        "one shot",
-        "monotonic",
-        "pointer bump",
-        "bump allocat",
-        "bump",
-    ];
-    let default_kw = [
-        "general-purpose",
-        "general purpose",
-        "desktop app",
-        "desktop application",
-        "variable size",
-        "varied size",
-        "mixed workload",
-    ];
+fn class_for(size: i64) -> Option<usize> {
+    CLASSES.iter().position(|&c| c >= size)
+}
 
-    let score = |kws: &[&str]| kws.iter().filter(|k| d.contains(*k)).count();
+struct Allocator {
+    bump_offset: i64,
+    // One free list (LIFO) and live-count per size class.
+    free_lists: [Vec<i64>; 8],
+    alloc_counts: [i64; 8],
+    // Every address ever handed out remembers which class it belongs to,
+    // so FREE can find the right free list without the caller telling us.
+    class_of_addr: HashMap<i64, usize>,
+    allocated: HashSet<i64>,
+}
 
-    // Iterator::max_by_key keeps the *last* of equally-scored candidates,
-    // so this is listed lowest-priority-first: on a tie, slab beats
-    // tcmalloc beats buddy beats bump beats arena beats default.
-    let candidates: [(&str, usize); 6] = [
-        ("default", score(&default_kw)),
-        ("arena", score(&arena_kw)),
-        ("bump", score(&bump_kw)),
-        ("buddy", score(&buddy_kw)),
-        ("tcmalloc", score(&tcmalloc_kw)),
-        ("slab", score(&slab_kw)),
-    ];
+impl Allocator {
+    fn new() -> Self {
+        Allocator {
+            bump_offset: 0,
+            free_lists: Default::default(),
+            alloc_counts: [0; 8],
+            class_of_addr: HashMap::new(),
+            allocated: HashSet::new(),
+        }
+    }
 
-    match candidates.iter().max_by_key(|&&(_, s)| s) {
-        Some(&(name, s)) if s > 0 => name,
-        _ => "default",
+    // Reuse a freed block from the class's own free list before growing
+    // the bump region, so freed space is never wasted while it's
+    // available.
+    fn alloc(&mut self, size: i64) -> Option<i64> {
+        let idx = class_for(size.max(1))?;
+        let class_size = CLASSES[idx];
+
+        let addr = if let Some(addr) = self.free_lists[idx].pop() {
+            addr
+        } else {
+            if self.bump_offset + class_size > TOTAL_HEAP {
+                return None;
+            }
+            let addr = self.bump_offset;
+            self.bump_offset += class_size;
+            addr
+        };
+
+        self.class_of_addr.insert(addr, idx);
+        self.allocated.insert(addr);
+        self.alloc_counts[idx] += 1;
+        Some(addr)
+    }
+
+    fn free(&mut self, addr: i64) -> bool {
+        if !self.allocated.remove(&addr) {
+            return false;
+        }
+        let idx = self.class_of_addr[&addr];
+        self.alloc_counts[idx] -= 1;
+        self.free_lists[idx].push(addr);
+        true
+    }
+
+    fn print_stats(&self) {
+        for i in 0..CLASSES.len() {
+            println!(
+                "class={} alloc={} free={}",
+                CLASSES[i],
+                self.alloc_counts[i],
+                self.free_lists[i].len()
+            );
+        }
+        println!("bump={}/{}", self.bump_offset, TOTAL_HEAP);
     }
 }
 
 fn main() {
     let stdin = io::stdin();
+    let mut alloc = Allocator::new();
+
     for line in stdin.lock().lines() {
         let l = line.unwrap();
         if l.is_empty() {
             continue;
         }
-        println!("{}", classify(&l));
+
+        let spl: Vec<&str> = l.split(' ').collect();
+
+        match spl[0] {
+            "ALLOC" => {
+                let size = spl[1].parse::<i64>().unwrap();
+                match alloc.alloc(size) {
+                    Some(addr) => println!("{}", addr),
+                    None => println!("OOM"),
+                }
+            }
+            "FREE" => {
+                let addr = spl[1].parse::<i64>().unwrap();
+                if alloc.free(addr) {
+                    println!("OK");
+                } else {
+                    println!("BAD");
+                }
+            }
+            "STATS" => {
+                alloc.print_stats();
+            }
+            _ => println!("POOP"),
+        }
     }
 }
